@@ -1,116 +1,128 @@
+import logging
+from datetime import datetime, timedelta
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from pytz import timezone
 from telegram import Update, Bot
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
-import datetime
-import json
-from apscheduler.schedulers.background import BackgroundScheduler
+# Import token
 import config
-import pytz
 
-CHANNEL, TIME = range(2)  # State definitions for the conversation
+# Define states for conversation
+CHANNEL, MESSAGE, CONFIRM = range(3)
 
-# Load or initialize data
-def load_schedule():
+# Set up basic logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+# Error handler function
+def error(update, context):
+    """Log Errors caused by Updates."""
+    logger.error('Update caused error:', exc_info=context.error)
     try:
-        with open('schedule.json', 'r') as file:
-            return json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        update.message.reply_text('An error occurred: {}'.format(context.error))
+    except Exception as e:
+        logger.error('Error while handling the previous error: %s', e)
 
-def save_schedule(schedule):
-    with open('schedule.json', 'w') as file:
-        json.dump(schedule, file)
 
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text('Please send me the channel ID where you want to post your message.')
+    update.message.reply_text("Hello! Welcome to the Scheduler Bot. Type /help for instructions.")
+
+
+def help_command(update: Update, context: CallbackContext):
+    help_text = (
+        "To schedule a message:\n"
+        "- Start with /schedule.\n"
+        "- Enter the channel ID (e.g., @your_channel).\n"
+        "- Enter your message.\n"
+        "- Enter the date and time in 'DD/MM/YYYY HH:MM' format (24-hour clock)."
+    )
+    update.message.reply_text(help_text)
+
+
+def schedule(update: Update, context: CallbackContext):
+    update.message.reply_text("Please enter the channel ID where you want to schedule a message:")
     return CHANNEL
 
+
 def receive_channel(update: Update, context: CallbackContext):
-    user_data = context.user_data
-    user_data['channel'] = update.message.text
-    update.message.reply_text('Now send me your message followed by the time (HH:MM) you want it to be posted.')
-    return TIME
+    context.user_data['channel'] = update.message.text
+    update.message.reply_text("Please enter your message:")
+    return MESSAGE
 
-def receive_time_and_message(update: Update, context: CallbackContext):
-    text = update.message.text
+
+def receive_message(update: Update, context: CallbackContext):
+    context.user_data['message'] = update.message.text
+    update.message.reply_text("Please enter the date and time for the message (DD/MM/YYYY HH:MM):")
+    return CONFIRM
+
+
+def confirm(update: Update, context: CallbackContext):
     try:
-        # Assuming the last 16 characters are date and time in 'DD/MM/YYYY HH:MM' format
-        date_time_str = text[-16:]
-        message_text = text[:-17]  # Remove last 17 characters (16 for datetime and 1 space)
+        date_time_str = update.message.text
+        # Parse the string into a datetime object assuming it's in local time format
+        naive_time = datetime.strptime(date_time_str, '%d/%m/%Y %H:%M')
 
-        # Convert string to datetime object
-        scheduled_datetime = datetime.datetime.strptime(date_time_str, '%d/%m/%Y %H:%M')
+        # Define the timezone you are working with
+        warsaw_tz = timezone('Europe/Warsaw')
 
-        # Store the scheduled message in the JSON file or database
-        schedule = load_schedule()
-        schedule_key = f"{update.message.chat_id}_{scheduled_datetime.strftime('%d/%m/%Y %H:%M')}"
-        schedule[schedule_key] = {
-            'channel': context.user_data['channel'],
-            'message': message_text,
-            'datetime': scheduled_datetime.isoformat()
-        }
-        save_schedule(schedule)
+        # Localize the naive datetime object with the specified timezone
+        local_time = warsaw_tz.localize(naive_time)
 
-        update.message.reply_text(f"Message scheduled for {date_time_str} UTC to be posted on the channel {context.user_data['channel']}.")
+        # Debug log to check the datetime object
+        logging.debug("Scheduled time (timezone-aware): %s", local_time)
+
+        # Adding job to scheduler
+        scheduler.add_job(send_message, 'date', run_date=local_time,
+                          args=[context.user_data['channel'], context.user_data['message']])
+        update.message.reply_text(f"Message scheduled for {local_time} at {context.user_data['channel']}.")
         return ConversationHandler.END
     except ValueError:
-        update.message.reply_text('Please ensure the date and time are in DD/MM/YYYY HH:MM format.')
-        return TIME
+        update.message.reply_text("Incorrect date format. Please use DD/MM/YYYY HH:MM format.")
+        return CONFIRM
+    except Exception as e:
+        logging.error("Failed to schedule message: %s", e)
+        update.message.reply_text(f"An error occurred: {e}")
+        return ConversationHandler.END
+
+
+def send_message(channel_id, text):
+    bot = Bot(config.TOKEN)
+    bot.send_message(chat_id=channel_id, text=text)
+
 
 def cancel(update: Update, context: CallbackContext):
-    update.message.reply_text('Operation cancelled.')
+    update.message.reply_text('Scheduling cancelled.')
     return ConversationHandler.END
-
-def send_scheduled_messages():
-    now = datetime.datetime.utcnow()
-    schedule = load_schedule()
-    bot = Bot(config.TOKEN)
-    for key, info in list(schedule.items()):
-        scheduled_datetime = datetime.datetime.fromisoformat(info['datetime'])
-        if now >= scheduled_datetime:
-            bot.send_message(chat_id=info['channel'], text=info['message'])
-            del schedule[key]  # Remove the message after sending
-    save_schedule(schedule)
 
 
 def main():
     updater = Updater(config.TOKEN, use_context=True)
     dispatcher = updater.dispatcher
 
-    # Command handlers
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("help", help_command))
-    dispatcher.add_handler(ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+    # Job scheduler
+    global scheduler
+    scheduler = BackgroundScheduler(timezone=pytz.utc)
+    scheduler.start()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('schedule', schedule)],
         states={
             CHANNEL: [MessageHandler(Filters.text & ~Filters.command, receive_channel)],
-            TIME: [MessageHandler(Filters.text & ~Filters.command, receive_time_and_message)],
+            MESSAGE: [MessageHandler(Filters.text & ~Filters.command, receive_message)],
+            CONFIRM: [MessageHandler(Filters.text & ~Filters.command, confirm)],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
-    ))
+    )
 
-    # Job scheduler and polling
-    scheduler = BackgroundScheduler(timezone=pytz.timezone('Europe/Warsaw'))
-    scheduler.add_job(send_scheduled_messages, 'cron', minute='*')
-    scheduler.start()
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("help", help_command))
+    dispatcher.add_handler(conv_handler)
+    dispatcher.add_error_handler(error)
 
     updater.start_polling()
     updater.idle()
-
-
-def help_command(update: Update, context: CallbackContext):
-    help_text = (
-        "Here's how to use this bot:\n"
-        "1. Start by sending /start to initiate the bot.\n"
-        "2. The bot will ask for the channel ID where you want messages to be posted.\n"
-        "   Respond with the channel ID (e.g., @your_channel_name or a numeric ID).\n"
-        "3. Next, send your message followed by the date and time in 'DD/MM/YYYY HH:MM' format.\n"
-        "   Example: 'Happy Birthday! 25/12/2024 18:30' - This will schedule your message on 25th December 2024 at 18:30.\n"
-        "4. If you need to cancel the operation at any time, just send /cancel.\n"
-        "5. To see this message again, type /help.\n"
-    )
-    update.message.reply_text(help_text)
-
-
 
 
 if __name__ == '__main__':
