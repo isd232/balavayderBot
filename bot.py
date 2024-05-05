@@ -10,10 +10,12 @@ import config
 
 # Define states for conversation
 CHANNEL, MESSAGE, CONFIRM = range(3)
+DECISION = 4
 
 # Set up basic logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 
 
 # Error handler function
@@ -42,14 +44,41 @@ def help_command(update: Update, context: CallbackContext):
 
 
 def schedule(update: Update, context: CallbackContext):
-    update.message.reply_text("Please enter the channel ID where you want to schedule a message:")
-    return CHANNEL
+    user_id = update.effective_user.id
+    saved_channel_id = get_saved_channel_id(user_id)
+    if saved_channel_id:
+        context.user_data['channel'] = saved_channel_id
+        update.message.reply_text(f"Using your saved channel ID: {saved_channel_id}. Please enter your message:")
+        return MESSAGE
+    else:
+        update.message.reply_text("Please enter the channel ID where you want to schedule a message:")
+        return CHANNEL
+
+
+def save_channel_id(user_id, channel_id):
+    with open('channel_ids.txt', 'a') as f:
+        f.write(f"{user_id}:{channel_id}\n")
 
 
 def receive_channel(update: Update, context: CallbackContext):
-    context.user_data['channel'] = update.message.text
-    update.message.reply_text("Please enter your message:")
+    user_id = update.effective_user.id
+    channel_id = update.message.text
+    context.user_data['channel'] = channel_id
+    save_channel_id(user_id, channel_id)
+    update.message.reply_text("Channel ID saved. Please enter your message:")
     return MESSAGE
+
+
+def get_saved_channel_id(user_id):
+    try:
+        with open('channel_ids.txt', 'r') as f:
+            lines = f.readlines()
+            for line in lines:
+                uid, cid = line.strip().split(':')
+                if int(uid) == user_id:
+                    return cid
+    except FileNotFoundError:
+        return None
 
 
 def receive_message(update: Update, context: CallbackContext):
@@ -61,35 +90,46 @@ def receive_message(update: Update, context: CallbackContext):
 def confirm(update: Update, context: CallbackContext):
     try:
         date_time_str = update.message.text
-        # Parse the string into a datetime object assuming it's in local time format
         naive_time = datetime.strptime(date_time_str, '%d/%m/%Y %H:%M')
+        local_tz = timezone('Europe/Warsaw')
+        scheduled_time = local_tz.localize(naive_time)
 
-        # Define the timezone you are working with
-        warsaw_tz = timezone('Europe/Warsaw')
-
-        # Localize the naive datetime object with the specified timezone
-        local_time = warsaw_tz.localize(naive_time)
-
-        # Debug log to check the datetime object
-        logging.debug("Scheduled time (timezone-aware): %s", local_time)
-
-        # Adding job to scheduler
-        scheduler.add_job(send_message, 'date', run_date=local_time,
-                          args=[context.user_data['channel'], context.user_data['message']])
-        update.message.reply_text(f"Message scheduled for {local_time} at {context.user_data['channel']}.")
+        # Add the job to the scheduler
+        scheduler.add_job(
+            send_message,
+            'date',
+            run_date=scheduled_time,
+            args=[
+                context.user_data['channel'],
+                context.user_data['message'],
+                update.effective_user.id
+            ]
+        )
+        update.message.reply_text(f"Message scheduled for {scheduled_time} at {context.user_data['channel']}.")
         return ConversationHandler.END
     except ValueError:
         update.message.reply_text("Incorrect date format. Please use DD/MM/YYYY HH:MM format.")
         return CONFIRM
-    except Exception as e:
-        logging.error("Failed to schedule message: %s", e)
-        update.message.reply_text(f"An error occurred: {e}")
+
+
+def handle_user_decision(update: Update, context: CallbackContext):
+    decision = update.message.text.lower()
+    if decision == 'yes':
+        return schedule(update, context)
+    elif decision == 'no':
+        update.message.reply_text("Thank you for using the bot. Goodbye!")
         return ConversationHandler.END
+    else:
+        update.message.reply_text("Please reply with 'yes' to continue or 'no' to end.")
+        return DECISION  # Assuming DECISION is the constant for this state
 
 
-def send_message(channel_id, text):
+def send_message(channel_id, message_text, user_id):
     bot = Bot(config.TOKEN)
-    bot.send_message(chat_id=channel_id, text=text)
+    # Send the scheduled message to the channel
+    bot.send_message(chat_id=channel_id, text=message_text)
+    # Send a follow-up message to the user who scheduled the message
+    bot.send_message(chat_id=user_id, text="Message sent! Do you want to schedule another message? Reply with 'yes' to continue or 'no' to stop.")
 
 
 def cancel(update: Update, context: CallbackContext):
@@ -112,6 +152,7 @@ def main():
             CHANNEL: [MessageHandler(Filters.text & ~Filters.command, receive_channel)],
             MESSAGE: [MessageHandler(Filters.text & ~Filters.command, receive_message)],
             CONFIRM: [MessageHandler(Filters.text & ~Filters.command, confirm)],
+            DECISION: [MessageHandler(Filters.text & ~Filters.command, handle_user_decision)]
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
@@ -123,6 +164,7 @@ def main():
 
     updater.start_polling()
     updater.idle()
+
 
 
 if __name__ == '__main__':
